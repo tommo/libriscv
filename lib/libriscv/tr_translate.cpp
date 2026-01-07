@@ -645,6 +645,7 @@ if constexpr (SCAN_FOR_GP) {
 				options.translate_use_register_caching,
 				options.translate_use_syscall_clobbering_optimization,
 				options.translate_automatic_nbit_address_space,
+				options.translate_use_virtual_paging_fallback,
 				options.translate_unsafe_remove_checks,
 				std::move(jump_locations),
 				std::move(single_return_locations),
@@ -1406,7 +1407,7 @@ CallbackTable<W> create_bintr_callback_table(DecodedExecuteSegment<W>&)
 		.trigger_exception = [] (CPU<W>& cpu, address_type<W> pc, int e) {
 			cpu.registers().pc = pc; // XXX: Set PC to the failing instruction (?)
 #ifdef RISCV_LIBTCC
-			if (libtcc_enabled && cpu.current_execute_segment().is_libtcc())
+			if (cpu.current_execute_segment().is_libtcc())
 			{
 				// If we're using libtcc, we can't throw C++ exceptions because
 				// there's no unwinding support. But we can mark an exception
@@ -1415,9 +1416,9 @@ CallbackTable<W> create_bintr_callback_table(DecodedExecuteSegment<W>&)
 					cpu.trigger_exception(e);
 				} catch (...) {
 					cpu.set_current_exception(std::current_exception());
-					// Trigger a slow-path in dispatch (which will check for exceptions)
-					cpu.machine().stop();
 				}
+				// Trigger a slow-path in dispatch (which will check for exceptions)
+				cpu.machine().stop();
 				return;
 			}
 #endif

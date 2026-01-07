@@ -195,6 +195,11 @@ namespace riscv
 		/// @details This will allow the binary translator to use and-masked addresses
 		/// for all memory accesses, which can drastically improve performance.
 		bool translate_automatic_nbit_address_space = false;
+		/// @brief Enable access to virtual pages outside of the arena in the binary translator.
+		/// @details Disabling this will simplifiy memory accesses, allowing up to 8 nearby
+		/// accesses to use only a single bounds-check. However, accessing virtual pages
+		/// outside of the arena will throw a protection fault exception.
+		bool translate_use_virtual_paging_fallback = true;
 		/// @brief Enable unsafe removal of checks in the binary translator.
 		/// @details This will remove checks that prevent the program from crashing, such
 		/// as memory access checks, and other checks that sandboxes normally provide.

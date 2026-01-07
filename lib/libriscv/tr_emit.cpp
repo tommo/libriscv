@@ -306,13 +306,6 @@ struct Emitter
 		}
 	}
 
-	std::string arena_at_unsafe(const std::string& address) {
-		if (tinfo.is_libtcc && !tinfo.use_shared_execute_segments) {
-			return "(" + m_arena_hex_address + " + " + address + ")";
-		}
-		return "ARENA_AT(cpu, " + address + ")";
-	}
-
 	std::string arena_at_fixed(const std::string& type, address_t address) {
 		if (tinfo.is_libtcc && !tinfo.use_shared_execute_segments) {
 			if (uses_Nbit_encompassing_arena()) {
@@ -324,6 +317,57 @@ struct Emitter
 			return "*(" + type + "*)ARENA_AT(cpu, " + hex_address(address & address_t(get_Nbit_encompassing_arena_mask())) + ")";
 		} else {
 			return "*(" + type + "*)ARENA_AT(cpu, " + speculation_safe(address) + ")";
+		}
+	}
+
+	static bool offset_is_within_overallocation(int64_t old_offset, int64_t new_offset, size_t size) {
+		return std::abs(new_offset - old_offset) <= int64_t(Memory<W>::OVERALLOCATE - size);
+	}
+
+	bool skip_load_bounds_check(int reg, int64_t offset, size_t size) {
+		if (tinfo.unsafe_remove_checks
+			|| uses_Nbit_encompassing_arena()) return true; // No bounds check
+		if (tinfo.use_virtual_paging_fallback) return false; // Always check
+
+		if (last_read_check_pc == m_last_pc
+			&& last_read_check_register == reg
+			&& offset_is_within_overallocation(last_read_check_offset, offset, size)) {
+			// Skip bounds check, but continue (same register, same original bounds-checked offset)
+			last_read_check_pc = pc();
+			return true;
+		} else if (last_write_check_pc == m_last_pc
+			&& last_write_check_register == reg
+			&& offset_is_within_overallocation(last_write_check_offset, offset, size)) {
+			// Previous was a write check for same register + offset range
+			// The arena is divided into unreadable, readable and writable regions,
+			// and any region that is writable is also readable, so we inherit the check:
+			last_read_check_pc = pc();
+			last_read_check_register = reg;
+			last_read_check_offset = offset;
+			return true;
+		} else {
+			last_read_check_pc = pc();
+			last_read_check_register = reg;
+			last_read_check_offset = offset;
+			return false;
+		}
+	}
+	bool skip_store_bounds_check(int reg, int64_t offset, size_t size) {
+		if (tinfo.unsafe_remove_checks
+			|| uses_Nbit_encompassing_arena()) return true; // No bounds check
+		if (tinfo.use_virtual_paging_fallback) return false; // Always check
+
+		if (last_write_check_pc == m_last_pc
+			&& last_write_check_register == reg
+			&& offset_is_within_overallocation(last_write_check_offset, offset, size)) {
+			// Skip bounds check
+			last_write_check_pc = pc();
+			return true;
+		} else {
+			last_write_check_pc = pc();
+			last_write_check_register = reg;
+			last_write_check_offset = offset;
+			return false;
 		}
 	}
 
@@ -367,20 +411,21 @@ struct Emitter
 		}
 
 		const std::string address = from_untracked_reg(reg) + " + " + from_imm(imm);
-		if (uses_Nbit_encompassing_arena())
+		if (skip_load_bounds_check(reg, imm, sizeof(T)))
 		{
 			add_code(dst + " = *(" + type + "*)" + arena_at(address) + ";");
-		}
-		else if (uses_flat_memory_arena() && tinfo.unsafe_remove_checks) {
-			// If unsafe remove checks is enabled, we can skip the check
-			add_code(dst + " = *(" + type + "*)" + arena_at_unsafe(address) + ";");
 		}
 		else if (uses_flat_memory_arena()) {
 			add_code(
 				"if (LIKELY(ARENA_READABLE(" + address + ")))",
 					dst + " = *(" + type + "*)" + arena_at(address) + ";",
 				"else {");
-			if ((W == 8 && (type == "int64_t" || type == "uint64_t"))
+			if (!tinfo.use_virtual_paging_fallback) {
+				add_code("  cpu->pc = " + hex_address(this->pc()) + "LL; goto exception;",
+						"}");
+				return;
+			}
+			else if ((W == 8 && (type == "int64_t" || type == "uint64_t"))
 				|| (W == 4 && (type == "int32_t" || type == "uint32_t"))) {
 				add_code(
 					dst + " = " + memory_load_type<T>(address) + ";",
@@ -432,20 +477,22 @@ struct Emitter
 		}
 
 		const std::string address = from_untracked_reg(reg) + " + " + from_imm(imm);
-		if (uses_Nbit_encompassing_arena())
+		if (skip_store_bounds_check(reg, imm, sizeof(type)))
 		{
 			add_code("*(" + type + "*)" + arena_at(address) + " = " + value + ";");
-		}
-		else if (tinfo.unsafe_remove_checks && uses_flat_memory_arena()) {
-			add_code("*(" + type + "*)" + arena_at_unsafe(address) + " = " + value + ";");
 		}
 		else if (uses_flat_memory_arena()) {
 			add_code(
 				"if (LIKELY(ARENA_WRITABLE(" + address + ")))",
 				"  *(" + type + "*)" + arena_at(address) + " = " + value + ";",
-				"else {",
-				"  " + memory_store_type(type, address, value) + ";",
-				"}");
+				"else {");
+			if (!tinfo.use_virtual_paging_fallback) {
+				add_code("  cpu->pc = " + hex_address(this->pc()) + "LL; goto exception;",
+						"}");
+			} else {
+				add_code("  " + memory_store_type(type, address, value) + ";",
+						"}");
+			}
 		} else {
 			add_code(
 				memory_store_type(type, address, value)
@@ -555,16 +602,25 @@ private:
 	}
 	void reset_all_tracked_registers() {
 		this->m_is_tracked_register.fill(false);
+		this->last_read_check_pc = 0;
+		this->last_write_check_pc = 0;
 	}
 
 	std::string code;
 	size_t m_idx = 0;
 	address_t m_pc = 0x0;
+	address_t m_last_pc = 0x0;
 	rv32i_instruction instr;
 	unsigned m_instr_length = 0;
 	uint64_t m_instr_counter = 0;
 	uint32_t m_zero_insn_counter = 0;
 	address_t m_encompassing_arena_mask = 0;
+	address_t last_read_check_pc = 0;
+	address_t last_write_check_pc = 0;
+	int last_read_check_register = 0;
+	int last_read_check_offset = 0;
+	int last_write_check_register = 0;
+	int last_write_check_offset = 0;
 	bool m_used_store_syscalls = false;
 
 	std::array<bool, 32> gpr_exists {};
@@ -763,10 +819,13 @@ void Emitter<W>::emit()
 	code.append(FUNCLABEL(this->pc()) + ":;\n");
 	auto next_pc = tinfo.basepc;
 	address_t current_callable_pc = 0;
+	this->m_pc = tinfo.basepc;
+	this->m_last_pc = tinfo.basepc;
 
 	for (int i = 0; i < int(tinfo.instr.size()); i++) {
 		this->m_idx = i;
 		this->instr = tinfo.instr[i];
+		this->m_last_pc = this->m_pc;
 		this->m_pc = next_pc;
 		if constexpr (compressed_enabled)
 			this->m_instr_length = this->instr.length();
@@ -2045,7 +2104,7 @@ void Emitter<W>::emit()
 	// If the function ends with an unimplemented instruction,
 	// we must gracefully finish, setting new PC and incrementing IC
 	this->increment_counter_so_far();
-	exit_function(STRADDR(this->end_pc()), true);
+	exit_function(STRADDR(this->end_pc()));
 }
 
 template <int W>
@@ -2157,6 +2216,7 @@ CPU<W>::emit(std::string& code, const TransInfo<W>& tinfo)
 	}
 	code += "default:\n";
 #endif
+	code += "exception_is_handled:\n"; // Re-using exit point for exceptions
 	for (size_t reg = 1; reg < e.CACHED_REGISTERS; reg++) {
 		if (e.gpr_exists_at(reg)) {
 			code += "  cpu->r[" + std::to_string(reg) + "] = " + e.loaded_regname(reg) + ";\n";
@@ -2167,6 +2227,12 @@ CPU<W>::emit(std::string& code, const TransInfo<W>& tinfo)
 
 	// Function code
 	code += e.get_code();
+
+	// Exception handler
+	if (!tinfo.use_virtual_paging_fallback) {
+		code += "exception:\n api.exception(cpu, pc, 2); max_ic = 0; goto exception_is_handled;\n";
+	}
+	code += "}\n";
 
 	return std::move(e.get_mappings());
 }
