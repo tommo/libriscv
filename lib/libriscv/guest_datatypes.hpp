@@ -343,6 +343,24 @@ struct GuestStdVector {
 		}
 	}
 
+	void assign(machine_t& machine, const std::vector<std::string>& vec)
+	{
+		static_assert(std::is_same_v<T, GuestStdString<W>>, "GuestStdVector<T> must be a vector of GuestStdString<W>");
+		this->free(machine);
+		if (vec.empty())
+			return;
+
+		// Specialization for std::vector<std::string>
+		auto [array, self] = this->alloc(machine, vec.size());
+		(void)self;
+		for (std::size_t i = 0; i < vec.size(); i++) {
+			T* str = new (&array[i]) T(machine, vec[i]);
+			str->move(this->ptr_begin + i * sizeof(T));
+		}
+		// Set new end only after all elements are constructed
+		this->ptr_end = this->ptr_begin + vec.size() * sizeof(T);
+	}
+
 	void assign(machine_t& machine, const std::vector<T>& vec)
 	{
 		auto [array, self] = alloc(machine, vec.size());
