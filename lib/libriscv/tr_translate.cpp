@@ -240,6 +240,9 @@ int CPU<W>::load_translation(const MachineOptions<W>& options,
 	}
 	// Also add the compiler flags to the checksum
 	checksum = crc32c(checksum, cflags.c_str(), cflags.size());
+	// Include library version in hash to invalidate cache on ABI changes (e.g. CallbackTable layout)
+	const uint32_t version_tag = (RISCV_VERSION_MAJOR << 16) | RISCV_VERSION_MINOR;
+	checksum = crc32c(checksum, &version_tag, sizeof(version_tag));
 	exec.set_translation_hash(checksum);
 
 	char filebuffer[512];
