@@ -30,13 +30,10 @@ namespace riscv
 				return page;
 			} else if (page.attr.is_cow) {
 				m_page_write_handler(*this, pageno, page);
-				// The page may be read-cached at this time
-				// and the page data has likely changed now.
 				this->invalidate_cache(pageno, &page);
 				return page;
 			}
 		} else {
-			// Handler must produce a new page, or throw
 			Page& page = m_page_fault_handler(*this, pageno, init);
 			if (LIKELY(page.attr.write)) {
 				this->invalidate_cache(pageno, &page);

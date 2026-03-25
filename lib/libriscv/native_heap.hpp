@@ -110,6 +110,16 @@ struct Arena
 
 	void set_max_chunks(unsigned new_max) { this->m_max_chunks = new_max; }
 
+	/// @brief Extend the arena with additional address space.
+	/// @param base The base address of the new region.
+	/// @param bytes The size of the new region.
+	void extend(PointerType base, size_t bytes);
+
+	/// @brief Set a callback invoked when malloc fails (OOM).
+	/// The callback should extend the arena and return bytes added, or 0 to fail.
+	using growth_func_t = Function<size_t(Arena& arena, size_t requested)>;
+	void set_growth_callback(growth_func_t func) { m_growth_callback = std::move(func); }
+
 	unsigned allocation_counter() const noexcept { return m_allocation_counter; }
 	unsigned deallocation_counter() const noexcept { return m_deallocation_counter; }
 
@@ -160,6 +170,8 @@ private:
 		= [] (auto, auto*) { return -1; };
 	unknown_realloc_func_t m_realloc_unknown_chunk
 		= [] (auto, auto) { return ReallocResult{0, 0}; };
+	growth_func_t m_growth_callback
+		= [] (Arena&, size_t) -> size_t { return 0; };
 	friend struct ArenaChunk;
 };
 
@@ -313,6 +325,14 @@ inline Arena::PointerType Arena::malloc(size_t size)
 	ArenaChunk* ch = base_chunk().find_free(length);
 	this->m_allocation_counter++;
 
+	if (ch == nullptr) {
+		// Try growth callback
+		size_t grown = m_growth_callback(*this, length);
+		if (grown > 0) {
+			ch = base_chunk().find_free(length);
+		}
+	}
+
 	if (ch != nullptr) {
 		ch->split_next(*this, length);
 		ch->free = false;
@@ -442,6 +462,23 @@ inline Arena::Arena(PointerType arena_base, PointerType arena_end)
 	m_base_chunk.size = arena_end - arena_base;
 	m_base_chunk.data = arena_base;
 	m_base_chunk.free = true;
+}
+
+inline void Arena::extend(PointerType base, size_t bytes)
+{
+	ArenaChunk* last = &m_base_chunk;
+	while (last->next) last = last->next;
+
+	PointerType current_end = last->data + (PointerType)last->size;
+
+	if (last->free && base == current_end) {
+		// Contiguous with last free chunk — just extend it
+		last->size += bytes;
+	} else {
+		// Add new free chunk (possibly non-contiguous)
+		auto* newch = new_chunk(nullptr, last, bytes, true, base);
+		last->next = newch;
+	}
 }
 
 inline void Arena::foreach(Function<void(const ArenaChunk&)> callback) const
