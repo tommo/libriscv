@@ -126,6 +126,18 @@ struct Arena
 			m_chunk_slab.resize(new_max);
 	}
 
+	/// @brief Extend the arena with additional address space.
+	/// @param base  The base guest address of the new region.
+	/// @param bytes The size of the new region in bytes.
+	/// @note If the region is contiguous with the trailing free chunk it is merged,
+	///       otherwise a new free chunk is appended to the list.
+	void extend(PointerType base, size_t bytes);
+
+	/// @brief Set a callback invoked when malloc() fails (OOM).
+	/// The callback should extend the arena and return bytes added, or 0 to fail.
+	using growth_func_t = Function<size_t(Arena& arena, size_t requested)>;
+	void set_growth_callback(growth_func_t func) { m_growth_callback = std::move(func); }
+
 	/// @brief Total number of successful malloc() / seq_alloc_aligned() calls since construction.
 	unsigned allocation_counter()   const noexcept { return m_allocation_counter; }
 
@@ -193,6 +205,8 @@ private:
 		= [] (auto, auto*) { return -1; };
 	unknown_realloc_func_t m_realloc_unknown_chunk
 		= [] (auto, auto) { return ReallocResult{0, 0}; };
+	growth_func_t m_growth_callback
+		= [] (Arena&, size_t) -> size_t { return 0; };
 };
 
 // ---------------------------------------------------------------------------
@@ -325,6 +339,13 @@ inline Arena::PointerType Arena::malloc(size_t size)
 	uint32_t idx = find_free(length);
 	this->m_allocation_counter++;
 
+	if (idx == ArenaChunk::NO_CHUNK) {
+		// Try growth callback
+		const size_t grown = m_growth_callback(*this, length);
+		if (grown > 0)
+			idx = find_free(length);
+	}
+
 	if (idx != ArenaChunk::NO_CHUNK) {
 		split_next(idx, length);
 		auto& ch = slab(idx);
@@ -449,6 +470,24 @@ inline Arena::Arena(PointerType arena_base, PointerType arena_end)
 inline Arena::Arena(const Arena& other)
 {
 	other.transfer(*this);
+}
+
+inline void Arena::extend(PointerType base, size_t bytes)
+{
+	uint32_t last = 0; // head of the chunk list
+	while (slab(last).next != ArenaChunk::NO_CHUNK)
+		last = slab(last).next;
+
+	auto& ch = slab(last);
+	const PointerType current_end = ch.data + (PointerType)ch.size;
+	if (ch.free && base == current_end) {
+		// Contiguous with last free chunk — just extend it
+		ch.size += bytes;
+	} else {
+		// Add new free chunk (possibly non-contiguous)
+		const uint32_t newIdx = new_chunk(ArenaChunk::NO_CHUNK, last, bytes, true, base);
+		ch.next = newIdx;
+	}
 }
 
 inline void Arena::transfer(Arena& dest) const
